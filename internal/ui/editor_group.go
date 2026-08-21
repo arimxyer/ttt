@@ -93,10 +93,13 @@ type EditorGroupWidget struct {
 	OnFileChange            func(path, lang, text string)
 	OnFileClose             func(path, lang string)
 	OnContentTabClose       func(id string)
-	OnError                 func(msg string)
-	OnNotify                func(msg string)
-	pendingNotify           []string
-	focused                 bool
+	// OnActiveContentChange fires after a tab switch or an in-place replacement
+	// changes what the editor group is showing.
+	OnActiveContentChange func()
+	OnError               func(msg string)
+	OnNotify              func(msg string)
+	pendingNotify         []string
+	focused               bool
 	// diagSources holds diagnostics keyed by source ("lsp", "plugin:<name>")
 	// then by file path. Merged per-path into each tab's Diagnostics.
 	diagSources map[string]map[string][]Diagnostic
@@ -196,6 +199,12 @@ func (g *EditorGroupWidget) notify(msg string) {
 	}
 }
 
+func (g *EditorGroupWidget) activeContentChanged() {
+	if g.OnActiveContentChange != nil {
+		g.OnActiveContentChange()
+	}
+}
+
 func (g *EditorGroupWidget) FlushNotifications() {
 	if g.OnNotify == nil {
 		return
@@ -241,11 +250,15 @@ func (g *EditorGroupWidget) IsActiveTabPinned() bool {
 func (g *EditorGroupWidget) OpenFile(path string) {
 	for i := range g.tabs {
 		if g.tabs[i].FilePath == path {
+			wasActive := i == g.active
 			g.tabs[i].Preview = false
 			if g.tabs[i].Buf != nil && !g.tabs[i].Buf.Dirty {
 				g.tabs[i].Buf.LoadFile(path)
 			}
 			g.SwitchTab(i)
+			if wasActive {
+				g.activeContentChanged()
+			}
 			return
 		}
 	}
@@ -299,6 +312,7 @@ func (g *EditorGroupWidget) OpenFile(path string) {
 	if t := g.activeTab(); t != nil && t.Preview && t.Content == nil && t.Buf != nil && !t.Buf.Dirty {
 		g.tabs[g.active] = newTab
 		g.syncTabs()
+		g.activeContentChanged()
 	} else {
 		g.tabs = append(g.tabs, newTab)
 		g.SwitchTab(len(g.tabs) - 1)
@@ -341,16 +355,28 @@ func (g *EditorGroupWidget) nextUntitledName() string {
 }
 
 func (g *EditorGroupWidget) OpenDiff(path string, fd diff.FileDiff, oldLines, newLines []string, extended bool) {
-	tabName := path + " (diff)"
+	g.OpenDiffTab(path+" (diff)", "", path, fd, oldLines, newLines, extended)
+}
+
+// OpenDiffTab opens a diff under an explicit tab key and label. Callers that can
+// produce several diffs of the same file — one per commit, say — need their own
+// key, or the second one would replace the first under an identical label.
+// path is still the real file path so the highlighter picks the right language.
+func (g *EditorGroupWidget) OpenDiffTab(tabName, title, path string, fd diff.FileDiff, oldLines, newLines []string, extended bool) {
 	for i, t := range g.tabs {
 		if t.FilePath == tabName {
+			wasActive := i == g.active
 			dw := NewDiffViewWidget(path, fd, oldLines, newLines, extended)
 			if !g.SyntaxHighlight {
 				dw.Highlighter = nil
 			}
 			t.Content = dw
+			t.Title = title
 			g.tabs[i] = t
 			g.SwitchTab(i)
+			if wasActive {
+				g.activeContentChanged()
+			}
 			return
 		}
 	}
@@ -360,6 +386,7 @@ func (g *EditorGroupWidget) OpenDiff(path string, fd diff.FileDiff, oldLines, ne
 	}
 	g.tabs = append(g.tabs, editorTab{
 		FilePath: tabName,
+		Title:    title,
 		Content:  widget,
 	})
 	g.SwitchTab(len(g.tabs) - 1)
@@ -368,10 +395,14 @@ func (g *EditorGroupWidget) OpenDiff(path string, fd diff.FileDiff, oldLines, ne
 func (g *EditorGroupWidget) OpenPluginTab(id, title string, content Widget) {
 	for i, t := range g.tabs {
 		if t.FilePath == id {
+			wasActive := i == g.active
 			t.Content = content
 			t.Title = title
 			g.tabs[i] = t
 			g.SwitchTab(i)
+			if wasActive {
+				g.activeContentChanged()
+			}
 			return
 		}
 	}
@@ -386,6 +417,7 @@ func (g *EditorGroupWidget) OpenPluginTab(id, title string, content Widget) {
 func (g *EditorGroupWidget) ClosePluginTab(id string) {
 	for i, t := range g.tabs {
 		if t.FilePath == id {
+			wasActive := i == g.active
 			if t.Content != nil && g.OnContentTabClose != nil {
 				g.OnContentTabClose(t.FilePath)
 			}
@@ -408,6 +440,9 @@ func (g *EditorGroupWidget) ClosePluginTab(id string) {
 				g.active = len(g.tabs) - 1
 			}
 			g.syncTabs()
+			if wasActive {
+				g.activeContentChanged()
+			}
 			return
 		}
 	}
@@ -568,6 +603,7 @@ func (g *EditorGroupWidget) SetUseTabs(useTabs bool) {
 
 func (g *EditorGroupWidget) SwitchTab(idx int) {
 	if idx >= 0 && idx < len(g.tabs) {
+		changed := idx != g.active
 		if t := g.activeTab(); t != nil && t.Content != nil {
 			if setter, ok := t.Content.(interface{ SetFocused(bool) }); ok {
 				setter.SetFocused(false)
@@ -582,6 +618,9 @@ func (g *EditorGroupWidget) SwitchTab(idx int) {
 					setter.SetFocused(true)
 				}
 			}
+		}
+		if changed {
+			g.activeContentChanged()
 		}
 	}
 }
@@ -634,6 +673,7 @@ func (g *EditorGroupWidget) CloseTab() {
 		g.active = len(g.tabs) - 1
 	}
 	g.syncTabs()
+	g.activeContentChanged()
 }
 
 func (g *EditorGroupWidget) CloseOtherTabs() {
@@ -705,6 +745,7 @@ func (g *EditorGroupWidget) HasDirtyOtherTabs() bool {
 }
 
 func (g *EditorGroupWidget) CloseAllTabs() {
+	activeChanged := g.pinnedCount == 0 || g.active != 0
 	kept := slices.Clone(g.tabs[:g.pinnedCount])
 	if len(kept) == 0 {
 		kept = []editorTab{{
@@ -721,9 +762,13 @@ func (g *EditorGroupWidget) CloseAllTabs() {
 	g.tabs = kept
 	g.active = 0
 	g.syncTabs()
+	if activeChanged {
+		g.activeContentChanged()
+	}
 }
 
 func (g *EditorGroupWidget) CloseAllSaved() {
+	activeFile := g.ActiveFilePath()
 	var kept []editorTab
 	for i := range g.tabs {
 		if i < g.pinnedCount || (g.tabs[i].Buf != nil && g.tabs[i].Buf.Dirty) {
@@ -739,6 +784,9 @@ func (g *EditorGroupWidget) CloseAllSaved() {
 		g.active = len(g.tabs) - 1
 	}
 	g.syncTabs()
+	if g.ActiveFilePath() != activeFile {
+		g.activeContentChanged()
+	}
 }
 
 func (g *EditorGroupWidget) HasDirtyTabs() bool {
@@ -932,8 +980,12 @@ func (g *EditorGroupWidget) OpenFileReadOnly(path, title string) {
 func (g *EditorGroupWidget) OpenBufferReadOnly(title, filePath string, lines []string) {
 	for i := range g.tabs {
 		if g.tabs[i].Title == title && g.tabs[i].ReadOnly {
+			wasActive := i == g.active
 			g.tabs[i].Buf.Lines = lines
 			g.SwitchTab(i)
+			if wasActive {
+				g.activeContentChanged()
+			}
 			return
 		}
 	}

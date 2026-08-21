@@ -17,6 +17,9 @@ type TreeNode struct {
 	Actions    []Action    `json:"actions,omitempty"`
 	Muted      bool        `json:"-"`
 	Expandable bool        `json:"-"`
+	// TruncateLeft overrides TreeConfig.TruncateLeft for this node, so one tree
+	// can hold both prose that reads from the left and paths whose tail matters.
+	TruncateLeft bool `json:"-"`
 
 	Expanded bool `json:"-"`
 	depth    int
@@ -49,6 +52,7 @@ type TreeConfig struct {
 	OnMenu     func(entries []MenuEntry, node *TreeNode, screenX, screenY int)
 	OnExpand   func(node *TreeNode)
 	OnSelect   func(node *TreeNode)
+	OnFocus    func()
 	OnKey      func(ev *tcell.EventKey, node *TreeNode) bool
 	RenderItem func(surface Surface, node *TreeNode, idx, y, w int, selected bool)
 }
@@ -86,9 +90,14 @@ func (t *TreeWidget) Width() int  { return 0 }
 // ContentHeight reports visible rows so scroll views can measure the tree.
 func (t *TreeWidget) ContentHeight() int { return len(t.flatList) + t.BoxOverheadH() }
 
-func (t *TreeWidget) Focusable() bool   { return true }
-func (t *TreeWidget) SetFocused(f bool) { t.focused = f }
-func (t *TreeWidget) IsFocused() bool   { return t.focused }
+func (t *TreeWidget) Focusable() bool { return true }
+func (t *TreeWidget) SetFocused(f bool) {
+	t.focused = f
+	if f && t.Config.OnFocus != nil {
+		t.Config.OnFocus()
+	}
+}
+func (t *TreeWidget) IsFocused() bool { return t.focused }
 
 func (t *TreeWidget) Selected() *TreeNode {
 	if t.selected >= 0 && t.selected < len(t.flatList) {
@@ -370,7 +379,7 @@ func (t *TreeWidget) renderNode(surface Surface, node *TreeNode, idx, y, w int) 
 		labelStyle = term.StyleMuted
 	}
 	labelRunes := []rune(node.Label)
-	if t.Config.TruncateLeft {
+	if t.Config.TruncateLeft || node.TruncateLeft {
 		labelRunes = truncateRunesLeft(labelRunes, maxX-x)
 	}
 	x = drawRunesClipped(surface, x, y, maxX, labelRunes, labelStyle)
